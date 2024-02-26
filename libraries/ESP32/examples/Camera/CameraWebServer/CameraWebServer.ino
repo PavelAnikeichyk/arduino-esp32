@@ -1,5 +1,7 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <freertos/task.h>
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -7,21 +9,23 @@
 //            Partial images will be transmitted if image exceeds buffer size
 //
 //            You must select partition scheme from the board menu that has at least 3MB APP space.
-//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15 
+//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15
 //            seconds to process single frame. Face Detection is ENABLED if PSRAM is enabled as well
 
-// ===================
+//****************************************************************************************************
+// CONFIGURATION
+//
 // Select camera model
-// ===================
+//****************************************************************************************************
 //#define CAMERA_MODEL_WROVER_KIT // Has PSRAM
-#define CAMERA_MODEL_ESP_EYE // Has PSRAM
+//#define CAMERA_MODEL_ESP_EYE // Has PSRAM
 //#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
 //#define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM
 //#define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM
 //#define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM
 //#define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM
 //#define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM
-//#define CAMERA_MODEL_AI_THINKER // Has PSRAM
+#define CAMERA_MODEL_AI_THINKER  // Has PSRAM
 //#define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM
 //#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
 // ** Espressif Internal Boards **
@@ -32,15 +36,45 @@
 //#define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
 
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-const char* ssid = "**********";
-const char* password = "**********";
+//****************************************************************************************************
+// CONFIGURATION
+//
+// Enter your WiFi credentials and UDP server configuration
+//****************************************************************************************************
+const char* ssid = "*******";
+const char* password = "*******";
 
+const char* udpServerDomain = "<your-tenant-id>.nodered.kaaiot.com";
+const int udpServerPort = 8888;
+
+
+//****************************************************************************************************
+// prototypes
+//****************************************************************************************************
 void startCameraServer();
+void startCameraUdpStream();
+uint8_t** initCameraStreamBuffers(size_t* length, SemaphoreHandle_t& mutex);
 void setupLedFlash(int pin);
 
+
+//****************************************************************************************************
+// variables
+//****************************************************************************************************
+#define UDP_FRAGMENT_SIZE 1024
+
+IPAddress udpServerIP;
+const int udpLocalPort = 8888; 
+WiFiUDP udpClient;
+
+// Shared buffer between tasks
+uint8_t** dataBufferPtr;
+size_t dataLengthInBuffer = 0;
+SemaphoreHandle_t dataBufferMutex;
+
+
+//****************************************************************************************************
+// setup
+//****************************************************************************************************
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
@@ -73,7 +107,7 @@ void setup() {
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 1;
-  
+
   // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
   //                      for larger pre-allocated frame buffer.
   if(config.pixel_format == PIXFORMAT_JPEG){
@@ -142,14 +176,78 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
 
-  startCameraServer();
+  WiFi.hostByName(udpServerDomain, udpServerIP);
+  Serial.print("UDP server IP: ");
+  Serial.println(udpServerIP);
 
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  Serial.print("Camera Ready! Configuration available by URL: http://");
+  Serial.println(WiFi.localIP());
+
+  // Initialize UDP
+  udpClient.begin(udpLocalPort);  // Local port for UDP communication
+  Serial.printf("Local UDP port: %d \r\n", udpLocalPort);
+
+  // Create a mutex for the buffer
+  dataBufferMutex = xSemaphoreCreateMutex();
+
+  // Create tasks
+  dataBufferPtr = initCameraStreamBuffers(&dataLengthInBuffer, dataBufferMutex);
+  startCameraServer();
+  xTaskCreatePinnedToCore(cameraStreamTask, "CameraStreamTask", 10000, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(udpConnectionTask, "UdpConnectionTask", 10000, NULL, 1, NULL, 1);
 }
 
+//****************************************************************************************************
+// loop
+//****************************************************************************************************
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
+  // Do nothing. Everything is done in other tasks
   delay(10000);
+}
+
+//****************************************************************************************************
+// cameraStreamTask
+//****************************************************************************************************
+void cameraStreamTask(void* pvParameters) {
+  while (true) {
+    startCameraUdpStream();
+    vTaskDelay(10000 / portTICK_PERIOD_MS);
+  }
+}
+
+//****************************************************************************************************
+// udpConnectionTask
+//****************************************************************************************************
+void udpConnectionTask(void* pvParameters) {
+  const uint8_t* buffer;
+  size_t bytesToSend, ptr;
+  while (true) {
+    if (xSemaphoreTake(dataBufferMutex, portMAX_DELAY)) {
+      if (dataLengthInBuffer > 0) {
+        // Send data via UDP
+        buffer = reinterpret_cast<const uint8_t*>(*dataBufferPtr);
+        ptr = 0;
+        do {
+          bytesToSend = dataLengthInBuffer - ptr;
+          if (bytesToSend > UDP_FRAGMENT_SIZE) { // send full fragment
+            bytesToSend = UDP_FRAGMENT_SIZE;
+          }
+          //Serial.printf("UDP b:%u, ptr:%u\r\n", lengthToSend, ptr);
+          udpClient.beginPacket(udpServerIP, udpServerPort);
+          udpClient.write(&buffer[ptr], bytesToSend);
+          udpClient.endPacket();
+          vTaskDelay(5 / portTICK_PERIOD_MS);
+          ptr += bytesToSend;
+        } while (ptr < dataLengthInBuffer);
+
+        // Reset the buffer after sending
+        dataLengthInBuffer = 0;
+      }
+
+      xSemaphoreGive(dataBufferMutex);  // Release the mutex
+    }
+
+    // Wait before sending data again
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
 }

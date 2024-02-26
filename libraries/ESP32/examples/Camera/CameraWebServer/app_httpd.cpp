@@ -19,6 +19,8 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+#include <HardwareSerial.h>
+#include <WiFiUdp.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -26,7 +28,7 @@
 
 // Face Detection will not work on boards without (or with disabled) PSRAM
 #ifdef BOARD_HAS_PSRAM
-#define CONFIG_ESP_FACE_DETECT_ENABLED 1
+#define CONFIG_ESP_FACE_DETECT_ENABLED 0
 // Face Recognition takes upward from 15 seconds per frame on chips other than ESP32S3
 // Makes no sense to have it enabled for them
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -49,13 +51,9 @@
                     /*<! 0: detect by one-stage which is less accurate but faster(without keypoints). */
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-#pragma GCC diagnostic ignored "-Wformat"
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #include "face_recognition_tool.hpp"
 #include "face_recognition_112_v1_s16.hpp"
 #include "face_recognition_112_v1_s8.hpp"
-#pragma GCC diagnostic error "-Wformat"
-#pragma GCC diagnostic warning "-Wstrict-aliasing"
 
 #define QUANT_TYPE 0 //if set to 1 => very large firmware, very slow, reboots when streaming...
 
@@ -78,7 +76,7 @@
 // LED FLASH setup
 #if CONFIG_LED_ILLUMINATOR_ENABLED
 
-#define LED_LEDC_GPIO 22    //configure LED pin
+#define LED_LEDC_CHANNEL 2 //Using different ledc channel/timer than camera
 #define CONFIG_LED_MAX_INTENSITY 255
 
 int led_duty = 0;
@@ -126,6 +124,8 @@ static int8_t is_enrolling = 0;
 
 #endif
 
+bool isCameraUdpClientEnabled = false;
+
 typedef struct
 {
     size_t size;  //number of values used for filtering
@@ -134,6 +134,11 @@ typedef struct
     int sum;
     int *values; //array to be filled with values
 } ra_filter_t;
+
+uint8_t bufferToSend[1024];
+uint8_t* bufferToSendPtr = bufferToSend;
+size_t* dataToSendLength;
+SemaphoreHandle_t mutexToSend;
 
 static ra_filter_t ra_filter;
 
@@ -290,7 +295,7 @@ void enable_led(bool en)
     {
         duty = CONFIG_LED_MAX_INTENSITY;
     }
-    ledcWrite(LED_LEDC_GPIO, duty);
+    ledcWrite(LED_LEDC_CHANNEL, duty);
     //ledc_set_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL, duty);
     //ledc_update_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL);
     log_i("Set LED intensity to %d", duty);
@@ -521,7 +526,19 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #endif
 }
 
-static esp_err_t stream_handler(httpd_req_t *req)
+//****************************************************************************************************
+//initCameraStreamBuffers
+//****************************************************************************************************
+uint8_t** initCameraStreamBuffers(size_t* length, SemaphoreHandle_t& mutex) {
+  dataToSendLength = length;
+  mutexToSend = mutex;
+  return &bufferToSendPtr;
+}
+
+//****************************************************************************************************
+//camera_udp_stream_client
+//****************************************************************************************************
+static esp_err_t camera_udp_stream_client()
 {
     camera_fb_t *fb = NULL;
     struct timeval _timestamp;
@@ -556,19 +573,13 @@ static esp_err_t stream_handler(httpd_req_t *req)
         last_frame = esp_timer_get_time();
     }
 
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK)
-    {
-        return res;
-    }
-
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "X-Framerate", "60");
-
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     isStreaming = true;
     enable_led(true);
 #endif
+
+    isCameraUdpClientEnabled = true;
+    uint16_t printInfoCounter = 0;
 
     while (true)
     {
@@ -732,16 +743,24 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
         if (res == ESP_OK)
         {
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if (res == ESP_OK)
-        {
-            size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        }
-        if (res == ESP_OK)
-        {
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+            if (xSemaphoreTake(mutexToSend, portMAX_DELAY) == pdTRUE) {
+              if (*dataToSendLength == 0) {
+                if (printInfoCounter >= 20) {
+                  printInfoCounter = 0;
+                  Serial.printf("Send %d bytes\r\n", _jpg_buf_len);
+                } else {
+                  printInfoCounter++;
+                }
+                
+                bufferToSendPtr = _jpg_buf;
+                *dataToSendLength = _jpg_buf_len;
+              }
+              xSemaphoreGive(mutexToSend);  // Release the mutex  
+
+              while(*dataToSendLength != 0) { // wait to send to avoid camera buffer corruption
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+              }           
+            }
         }
         if (fb)
         {
@@ -795,6 +814,25 @@ static esp_err_t stream_handler(httpd_req_t *req)
     enable_led(false);
 #endif
 
+    return res;
+}
+
+//****************************************************************************************************
+//startCameraUdpStream
+//****************************************************************************************************
+void startCameraUdpStream() {
+  camera_udp_stream_client();
+}
+//****************************************************************************************************
+
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    esp_err_t res = ESP_OK;
+    Serial.println("stream_handler()");
+    if (!isCameraUdpClientEnabled) {
+      camera_udp_stream_client();
+    }
+    
     return res;
 }
 
@@ -1390,7 +1428,8 @@ void startCameraServer()
 void setupLedFlash(int pin) 
 {
     #if CONFIG_LED_ILLUMINATOR_ENABLED
-    ledcAttach(pin, 5000, 8);
+    ledcSetup(LED_LEDC_CHANNEL, 5000, 8);
+    ledcAttachPin(pin, LED_LEDC_CHANNEL);
     #else
     log_i("LED flash is disabled -> CONFIG_LED_ILLUMINATOR_ENABLED = 0");
     #endif
